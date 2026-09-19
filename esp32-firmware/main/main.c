@@ -11,38 +11,26 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
-#include "freertos/queue.h"
-
-#include "lwip/sockets.h"
-#include "lwip/dns.h"
-#include "lwip/netdb.h"
 
 #include "esp_log.h"
 #include "mqtt_client.h"
 #include "driver/gpio.h"
+#include "cJSON.h"
 #include "dht22.h"
 
 static const char *TAG = "IOT_ESP32";
 
 #define DEVICE_ID "esp32-001"
-#define MQTT_BROKER_URL "mqtt://192.168.1.100:1883" // UPDATE THIS TO YOUR BROKER IP
+// TODO: Thay 192.168.1.100 bằng IP máy tính của bạn khi gõ lệnh ipconfig
+#define MQTT_BROKER_URL "mqtt://192.168.1.4:1883"
 #define DHT_PIN GPIO_NUM_15
 #define LED_PIN GPIO_NUM_2
 
 static bool led_state = false;
 static esp_mqtt_client_handle_t mqtt_client;
 
-static void log_error_if_nonzero(const char *message, int error_code)
-{
-    if (error_code != 0) {
-        ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
-    }
-}
-
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
-    ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32 "", base, event_id);
     esp_mqtt_event_handle_t event = event_data;
     esp_mqtt_client_handle_t client = event->client;
 
@@ -50,11 +38,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
         
-        // Publish ONLINE status
+        // Publish ONLINE status (retained = 1, qos = 1)
         char status_topic[100];
         sprintf(status_topic, "device/%s/status", DEVICE_ID);
         char status_payload[200];
-        sprintf(status_payload, "{\"deviceId\":\"%s\",\"status\":\"ONLINE\",\"timestamp\":\"2026-09-13T08:30:00Z\"}", DEVICE_ID);
+        sprintf(status_payload, "{\"deviceId\":\"%s\",\"status\":\"ONLINE\",\"timestamp\":\"2026-09-17T08:30:00Z\"}", DEVICE_ID);
         esp_mqtt_client_publish(client, status_topic, status_payload, 0, 1, 1);
 
         // Subscribe to command topic
@@ -68,23 +56,39 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
 
     case MQTT_EVENT_DATA:
-        ESP_LOGI(TAG, "MQTT_EVENT_DATA");
-        // STUDENT TODO: Parse JSON properly (cJSON). Here we do basic strstr for simplicity
+        ESP_LOGI(TAG, "MQTT_EVENT_DATA received on topic: %.*s", event->topic_len, event->topic);
         if (event->data_len > 0) {
-            char payload[256];
-            snprintf(payload, sizeof(payload), "%.*s", event->data_len, event->data);
-            
-            if (strstr(payload, "\"action\":\"LED_ON\"") != NULL) {
-                led_state = true;
-                gpio_set_level(LED_PIN, 1);
-                ESP_LOGI(TAG, "Turned LED ON");
-            } else if (strstr(payload, "\"action\":\"LED_OFF\"") != NULL) {
-                led_state = false;
-                gpio_set_level(LED_PIN, 0);
-                ESP_LOGI(TAG, "Turned LED OFF");
+            cJSON *root = cJSON_ParseWithLength(event->data, event->data_len);
+            if (root) {
+                cJSON *cmd_id = cJSON_GetObjectItem(root, "commandId");
+                cJSON *action = cJSON_GetObjectItem(root, "action");
+
+                if (cJSON_IsString(action)) {
+                    if (strcmp(action->valuestring, "LED_ON") == 0) {
+                        led_state = true;
+                        gpio_set_level(LED_PIN, 1);
+                        ESP_LOGI(TAG, "Turned LED ON");
+                    } else if (strcmp(action->valuestring, "LED_OFF") == 0) {
+                        led_state = false;
+                        gpio_set_level(LED_PIN, 0);
+                        ESP_LOGI(TAG, "Turned LED OFF");
+                    }
+
+                    // Gửi bản tin ACK về lại Backend
+                    if (cJSON_IsString(cmd_id)) {
+                        char ack_topic[100];
+                        sprintf(ack_topic, "device/%s/command/ack", DEVICE_ID);
+                        char ack_payload[300];
+                        sprintf(ack_payload, 
+                                "{\"commandId\":\"%s\",\"deviceId\":\"%s\",\"action\":\"%s\",\"status\":\"ACKNOWLEDGED\",\"led\":%s,\"timestamp\":\"2026-09-17T08:31:01Z\"}",
+                                cmd_id->valuestring, DEVICE_ID, action->valuestring, led_state ? "true" : "false");
+                        
+                        esp_mqtt_client_publish(client, ack_topic, ack_payload, 0, 1, 0);
+                        ESP_LOGI(TAG, "Sent ACK for command: %s", cmd_id->valuestring);
+                    }
+                }
+                cJSON_Delete(root);
             }
-            
-            // STUDENT TODO: Extract commandId and publish ACK properly
         }
         break;
         
@@ -98,7 +102,7 @@ static void mqtt_app_start(void)
     char lwt_topic[100];
     sprintf(lwt_topic, "device/%s/status", DEVICE_ID);
     char lwt_payload[200];
-    sprintf(lwt_payload, "{\"deviceId\":\"%s\",\"status\":\"OFFLINE\",\"timestamp\":\"2026-09-13T08:35:00Z\"}", DEVICE_ID);
+    sprintf(lwt_payload, "{\"deviceId\":\"%s\",\"status\":\"OFFLINE\",\"timestamp\":\"2026-09-17T08:35:00Z\"}", DEVICE_ID);
 
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = MQTT_BROKER_URL,
@@ -117,34 +121,34 @@ static void mqtt_app_start(void)
 
 void telemetry_task(void *pvParameters)
 {
-    float temp, hum;
+    float temp = 0.0f, hum = 0.0f;
     char topic[100];
     char payload[256];
     sprintf(topic, "device/%s/telemetry", DEVICE_ID);
 
     while (1) {
-        if (dht22_read(&temp, &hum) == 0) {
-            sprintf(payload, "{\"deviceId\":\"%s\",\"temperature\":%.1f,\"humidity\":%.1f,\"led\":%s,\"timestamp\":\"2026-09-13T08:30:00Z\"}", 
+        int ret = dht22_read(&temp, &hum);
+        if (ret == 0) {
+            sprintf(payload, "{\"deviceId\":\"%s\",\"temperature\":%.1f,\"humidity\":%.1f,\"led\":%s,\"timestamp\":\"2026-09-17T08:30:00Z\"}", 
                     DEVICE_ID, temp, hum, led_state ? "true" : "false");
             
             esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 0, 0);
             ESP_LOGI(TAG, "Published Telemetry: T=%.1f H=%.1f", temp, hum);
+        } else {
+            ESP_LOGW(TAG, "Failed to read DHT22 (code: %d)", ret);
         }
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "[APP] Startup..");
-    ESP_LOGI(TAG, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
-    ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
 
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // Connect WiFi (using ESP-IDF example connect component for simplicity in teaching)
     ESP_ERROR_CHECK(example_connect());
 
     gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
