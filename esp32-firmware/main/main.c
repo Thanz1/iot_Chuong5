@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <time.h>
 #include "esp_wifi.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
@@ -21,28 +22,43 @@
 static const char *TAG = "IOT_ESP32";
 
 #define DEVICE_ID "esp32-001"
-// TODO: Thay 192.168.1.100 bằng IP máy tính của bạn khi gõ lệnh ipconfig
-#define MQTT_BROKER_URL "mqtt://192.168.1.4:1883"
-#define DHT_PIN GPIO_NUM_15
-#define LED_PIN GPIO_NUM_2
+// IP máy tính của bạn khi gõ ipconfig
+#define MQTT_BROKER_URL "mqtt://192.168.110.81:1883"
+
+#define DHT_PIN          GPIO_NUM_15
+#define LED_PIN          GPIO_NUM_2
+#define BUZZER_PIN       GPIO_NUM_4
+#define TEMP_THRESHOLD   31.0f  // Ngưỡng cảnh báo: trên 31 độ C sẽ hú còi
 
 static bool led_state = false;
 static esp_mqtt_client_handle_t mqtt_client;
+
+// Hàm tạo chuỗi thời gian chuẩn ISO 8601 UTC
+static void get_iso8601_timestamp(char *buffer, size_t max_len)
+{
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    gmtime_r(&now, &timeinfo);
+    strftime(buffer, max_len, "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+}
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
     esp_mqtt_client_handle_t client = event->client;
+    char timestamp[32];
 
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        get_iso8601_timestamp(timestamp, sizeof(timestamp));
         
         // Publish ONLINE status (retained = 1, qos = 1)
         char status_topic[100];
         sprintf(status_topic, "device/%s/status", DEVICE_ID);
         char status_payload[200];
-        sprintf(status_payload, "{\"deviceId\":\"%s\",\"status\":\"ONLINE\",\"timestamp\":\"2026-09-17T08:30:00Z\"}", DEVICE_ID);
+        sprintf(status_payload, "{\"deviceId\":\"%s\",\"status\":\"ONLINE\",\"timestamp\":\"%s\"}", DEVICE_ID, timestamp);
         esp_mqtt_client_publish(client, status_topic, status_payload, 0, 1, 1);
 
         // Subscribe to command topic
@@ -76,12 +92,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
                     // Gửi bản tin ACK về lại Backend
                     if (cJSON_IsString(cmd_id)) {
+                        get_iso8601_timestamp(timestamp, sizeof(timestamp));
                         char ack_topic[100];
                         sprintf(ack_topic, "device/%s/command/ack", DEVICE_ID);
                         char ack_payload[300];
                         sprintf(ack_payload, 
-                                "{\"commandId\":\"%s\",\"deviceId\":\"%s\",\"action\":\"%s\",\"status\":\"ACKNOWLEDGED\",\"led\":%s,\"timestamp\":\"2026-09-17T08:31:01Z\"}",
-                                cmd_id->valuestring, DEVICE_ID, action->valuestring, led_state ? "true" : "false");
+                                "{\"commandId\":\"%s\",\"deviceId\":\"%s\",\"action\":\"%s\",\"status\":\"ACKNOWLEDGED\",\"led\":%s,\"timestamp\":\"%s\"}",
+                                cmd_id->valuestring, DEVICE_ID, action->valuestring, led_state ? "true" : "false", timestamp);
                         
                         esp_mqtt_client_publish(client, ack_topic, ack_payload, 0, 1, 0);
                         ESP_LOGI(TAG, "Sent ACK for command: %s", cmd_id->valuestring);
@@ -102,7 +119,7 @@ static void mqtt_app_start(void)
     char lwt_topic[100];
     sprintf(lwt_topic, "device/%s/status", DEVICE_ID);
     char lwt_payload[200];
-    sprintf(lwt_payload, "{\"deviceId\":\"%s\",\"status\":\"OFFLINE\",\"timestamp\":\"2026-09-17T08:35:00Z\"}", DEVICE_ID);
+    sprintf(lwt_payload, "{\"deviceId\":\"%s\",\"status\":\"OFFLINE\",\"timestamp\":\"2026-09-20T08:00:00Z\"}", DEVICE_ID);
 
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = MQTT_BROKER_URL,
@@ -123,17 +140,31 @@ void telemetry_task(void *pvParameters)
 {
     float temp = 0.0f, hum = 0.0f;
     char topic[100];
-    char payload[256];
+    char payload[300];
+    char timestamp[32];
     sprintf(topic, "device/%s/telemetry", DEVICE_ID);
 
     while (1) {
         int ret = dht22_read(&temp, &hum);
         if (ret == 0) {
-            sprintf(payload, "{\"deviceId\":\"%s\",\"temperature\":%.1f,\"humidity\":%.1f,\"led\":%s,\"timestamp\":\"2026-09-17T08:30:00Z\"}", 
-                    DEVICE_ID, temp, hum, led_state ? "true" : "false");
+            // CẢNH BÁO QUÁ NHIỆT: Nhiệt độ vượt quá 31 độ C thì còi hú
+            if (temp > TEMP_THRESHOLD) {
+                gpio_set_level(BUZZER_PIN, 1); // Bật còi
+                ESP_LOGW(TAG, "!!! CANH BAO QUA NHIET !!! Temp: %.1f C > %.1f C -> BUZZER ON", temp, TEMP_THRESHOLD);
+            } else {
+                gpio_set_level(BUZZER_PIN, 0); // Tắt còi
+            }
+
+            get_iso8601_timestamp(timestamp, sizeof(timestamp));
+
+            // Đóng gói payload telemetry chuẩn contract
+            sprintf(payload, 
+                    "{\"deviceId\":\"%s\",\"temperature\":%.1f,\"humidity\":%.1f,\"illuminance\":null,\"soilMoisture\":null,\"led\":%s,\"timestamp\":\"%s\"}", 
+                    DEVICE_ID, temp, hum, led_state ? "true" : "false", timestamp);
             
             esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 0, 0);
-            ESP_LOGI(TAG, "Published Telemetry: T=%.1f H=%.1f", temp, hum);
+            ESP_LOGI(TAG, "Published Telemetry: Temp=%.1f C, Hum=%.1f%%, Buzzer=%s", 
+                     temp, hum, (temp > TEMP_THRESHOLD) ? "ON" : "OFF");
         } else {
             ESP_LOGW(TAG, "Failed to read DHT22 (code: %d)", ret);
         }
@@ -151,8 +182,15 @@ void app_main(void)
 
     ESP_ERROR_CHECK(example_connect());
 
+    // Cấu hình LED output (GPIO 2)
+    gpio_reset_pin(LED_PIN);
     gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level(LED_PIN, 0);
+
+    // Cấu hình Còi Buzzer output (GPIO 4)
+    gpio_reset_pin(BUZZER_PIN);
+    gpio_set_direction(BUZZER_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(BUZZER_PIN, 0);
     
     dht22_init(DHT_PIN);
 
